@@ -1,0 +1,45 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: short-url-server
+
+  # ===== 数据源配置 (请改成你自己的 MySQL 账号密码) =====
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/short_url?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: root
+
+  # ===== Redis 配置 (没有密码就把 password 注释掉) =====
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      # password: 你的Redis密码
+      database: 0
+      timeout: 5000ms
+
+# ===== MyBatis-Plus 配置 =====
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      id-type: auto
+  mapper-locations: classpath:/mapper/*.xml
+
+# ===== 短链业务配置 =====
+short-url:
+  # 短链域名前缀(本地开发用,生产环境换成自己的域名)
+  domain: "http://localhost:8081/"
+  # Redis 缓存 key 前缀
+  cache-prefix: "short:url:"
+  # 缓存过期天数
+  cache-ttl-days: 7
+
+logging:
+  level:
+    com.shorturl: debug

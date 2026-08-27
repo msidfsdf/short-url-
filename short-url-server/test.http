@@ -1,0 +1,13 @@
+### 1. 生成短链
+POST http://localhost:8081/api/short-url/create
+Content-Type: application/json
+
+{
+  "originalUrl": "https://www.baidu.com/s?wd=这是一个测试用的超长链接"
+}
+
+### 2. 分页查询
+GET http://localhost:8081/api/short-url/list?current=1&size=10
+
+### 3. 短链跳转 (在浏览器中访问 http://localhost:8081/4c9g 测试)
+GET http://localhost:8081/4c9g
