@@ -573,3 +573,72 @@ cd "/c/Users/LENOVO/Desktop/short-url/short-url-server"
 - 压测当晚本机 Redis 未运行，用户手动拉起（`D:\Redis-x64-3.2.100`，net start 需管理员被拒）。
 - 未触碰 8081 上原有后端（PID 14780）；压测后端跑在 8082。
 
+---
+
+## 十五、阶段3 完成与本次会话事故归档（2026-08-30 会话）
+
+### 15.1 阶段3 交付内容（提交 `2f2b7f1`，已推送）
+
+消费端批量聚合：把「每条消息 1 次 UPDATE」改为「批内 HashMap 合并后 1 次 UPDATE +N」。
+
+| 文件 | 改动 |
+|---|---|
+| `RabbitMQConfig.java` | 自定义容器工厂，开启批量消费（batchSize=100 / receiveTimeout=250ms），预取 max(batchSize*2, 250) |
+| `ClickCountConsumer.java` | `List<Message>` 签名 + 手动取 deliveryTag；HashMap 合并；批量 ACK（multiple=true）；失败整批 NACK 进死信 |
+| `IShortUrlService` / `ShortUrlServiceImpl` | 新增 `recordClickBatch`；抽出 `simulateDbLatencyOnce()` |
+| `application.yml` | 新增 `batch-size` / `batch-timeout-ms` |
+| `tools/run_load_test_batch.py`（新增） | 压测主控 + 正确性闸门 |
+| `docs/阶段3版本说明书.md`（新增） | 十节：技术选型、设计点、6 个踩坑、压测结论、简历口径 |
+
+**压测结论（四组 + 一组同步基线，全部 PASS、落库率 100.00%）**：
+
+| 指标 | 阶段2 逐条 | 阶段3 批量 | 变化 |
+|---|---|---|---|
+| DB UPDATE（10 万次点击） | 99,500 | 995 | **-99%** |
+| 落库耗时（30ms，1 万次） | 376.8s | 8.9s | **约 -97.6%** |
+| QPS（0ms，10 万/500） | 4672.8 | 4224.6 | -9.6%（未提升） |
+
+### 15.2 一个被证伪的预测（重要）
+
+第四章曾断言「批量聚合后吞吐立刻反超同步」，14.1 节也留了"需复测拿到真数"的口子。补测同步基线后**证伪**：
+
+```
+同步 9227.9  >  MQ逐条 4672.8  >  MQ批量 4224.6
+```
+
+**根因**：单条消息约 60 字节，10 万条合计约 6MB，远未触及 RabbitMQ 默认内存高水位 → broker 流控从未触发 → 队列堆积从未拖累 QPS。真正的 QPS 天花板在**发布侧**（序列化 + broker 一跳 + publisher-confirm），批量聚合不解决它。
+
+**修正后的定位**：批量聚合解决的是**数据库写压力**与**最终一致性收敛速度**，不是接口吞吐。14.1 节"若要在简历写吞吐反超同步需复测"这条，**复测已完成，结论是不行**。
+
+### 15.3 概念辨析（易混淆，新会话务必先读）
+
+- **请求完成时间 ≠ 收敛时间**：前者是用户感知的毫秒级延迟（p50≈100ms），后者是后台 `click_count` 追平真实点击数的秒级耗时（A2 组 52.2s），相差约 500 倍，异步架构下互不影响。
+- **收敛快 ≠ 更新更频繁**：两种模式的 DB 写频率相同（都受限于慢下游的 30ms），差别在**每次写的步长**（+1 vs +100）。如同搬砖：往返趟数不变，但每趟从搬 1 块变成搬 100 块。
+- **批量聚合的真实价值**：把系统**可持续消费速率**从约 33 条/秒提升到约 3300 条/秒，消除持续流量下的队列无限积压风险。
+- **落库耗时含约 5 秒稳态确认开销**（连续 5 次轮询不变才判收敛），扣除后 30ms 场景约 371s → 3.9s，即约 95 倍，与 100:1 压缩比一致。
+
+### 15.4 本次会话的四起事故（教训）
+
+1. **四组压测数据全部作废**：对照组是死代码（`batch-enabled=false` 分支永远执行不到，实测 56374 次反序列化失败、0 次落库）；实验组拿不到 deliveryTag（整批拒收，四组 SQL 执行 0 次）；脚本把"读取失败(-1)"当"已排空(0)"，造成四组 `QueueDrained=True` 的假象。
+2. **`git stash push -- <pathspec>` 毁掉本地对象库**：`.git/refs` 消失、`.git/objects` 被清空（仅剩 6 个对象、无 pack）。**已修复**（远端重新 fetch + 手工写 refs）。此后一律用 `git diff HEAD -- <files> > xxx.patch` + `patch -p1 -R` 切换代码版本。
+3. **竞争消费者**：IntelliJ 中运行的 short-url 实例与压测后端抢同一队列（约 19% 消息），使批量组 UPDATE 计数从 995 虚高到 19559。压测前必须确认 8082 无监听且无其他 short-url 的 java 进程。
+4. **日志 I/O 不公平**：MyBatis 逐条 SQL 日志使对照组 825MB vs 实验组 17KB。已改为关闭 SQL 日志 + MySQL `Com_update` 计数器统计写次数。
+
+### 15.5 环境备忘（本次会话确认）
+
+- **RabbitMQ 未启用 management 插件**（15672 无监听），管理台 HTTP API 不可用；`rabbitmqctl` 因 Erlang cookie 不匹配（broker 以 SYSTEM 服务运行）也用不了；`sc`/`wmic` 被安全策略禁用。**队列深度只能靠 MySQL `click_count` 稳态判定**。
+- **MySQL 表名是 `t_short_url`**（库 `short_url`，root/root），不是 `short_url`。
+- **Maven 路径是 `C:\Users\LENOVO\.tools\maven\apache-maven-3.9.9\bin\mvn.cmd`**（不是 m2.cmd），需设 `JAVA_HOME` 为 `C:\Users\LENOVO\Desktop\jdk-17.0.18+8`。
+- **Redis 需先设** `CONFIG SET stop-writes-on-bgsave-error no` + `CONFIG SET dir <可写目录>`。
+- **spring-amqp 3.1.7 没有 `setBatchAckMode()` 方法**，编译会报"找不到符号"；批量模式取 deliveryTag 只能用 `List<Message>` + `getMessageProperties().getDeliveryTag()`。
+- **MyBatis 关闭日志的正确类名**：`org.apache.ibatis.logging.nologging.NoLoggingImpl`（包名是 `nologging` 不是 `nolog`）。
+- **本机 git 有个怪毛病**：`fetch`/`push` 后 `.git/refs/remotes/origin/` 目录偶尔被清掉，导致 `origin/main` 解析失败。远端实际是好的，用 `git ls-remote origin` 确认后手工写回 refs 文件即可。
+
+### 15.6 简历口径（定稿，覆盖 14.1 相关条目）
+
+**可写**：DB 写次数 -99%、可持续消费速率 33→3300 条/秒、慢下游收敛 376.8s→8.9s、终值一致性误差为 0、排查并修复 Spring AMQP 批量模式整批拒收。
+
+**不可写**：QPS 提升、p99/p50 优化、吞吐反超同步（均已证伪或属噪声）。
+
+**加分讲法**：主动讲"我预判 QPS 会涨 → 实测证伪 → 定位根因（流控未触发，天花板在发布侧）→ 修正优化目标"这个完整过程，比硬凑一个 QPS 数字更有说服力。
+
