@@ -28,4 +28,10 @@ public interface IShortUrlService {
      * 分页查询
      */
     Page<ShortUrlVO> page(int current, int size);
+
+    /**
+     * 异步累加点击次数 (由 MQ 消费者调用)
+     * 执行 click_count = click_count + 1 的原子更新, 与跳转请求路径解耦
+     */
+    void recordClick(String shortCode);
 }

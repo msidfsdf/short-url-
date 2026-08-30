@@ -21,6 +21,18 @@ spring:
       database: 0
       timeout: 5000ms
 
+  # ===== RabbitMQ 配置 (阶段3 异步点击统计) =====
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
+    # 生产者确认: broker 收到消息后回执, 提升可靠性
+    # (convertAndSend 默认发后不管, 发送失败仅记录日志, 不阻塞跳转)
+    publisher-confirm-type: correlated
+    publisher-returns: true
+
 # ===== MyBatis-Plus 配置 =====
 mybatis-plus:
   configuration:
@@ -39,6 +51,21 @@ short-url:
   cache-prefix: "short:url:"
   # 缓存过期天数
   cache-ttl-days: 7
+  # 点击统计模式开关: true=RabbitMQ 异步(阶段2, 默认), false=同步 UPDATE(阶段1 退化/降级)
+  click:
+    async-enabled: true
+    # 压测专用: 模拟下游 DB 写入耗时(ms), 用于演示 MQ 解耦"慢下游"的收益; 0=不模拟
+    simulate-db-latency-ms: 0
+  # ===== MQ 队列/交换机名称 (阶段3) =====
+  mq:
+    # 正常链路: 跳转发送点击事件 -> 消费者异步 +1
+    click-exchange: "short-url.click.exchange"
+    click-queue: "short-url.click.queue"
+    click-routing-key: "short-url.click.routing"
+    # 死信链路: 消费失败(拒绝且不重入队) -> 进入死信队列等待人工排查/重放
+    dlx-exchange: "short-url.dlx.exchange"
+    dlx-queue: "short-url.click.dlx.queue"
+    dlx-routing-key: "short-url.click.dlx.routing"
 
 logging:
   level:

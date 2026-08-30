@@ -16,7 +16,10 @@ CREATE TABLE t_short_url (
     create_time  DATETIME      NULL DEFAULT NULL COMMENT '创建时间',
     update_time  DATETIME      NULL DEFAULT NULL COMMENT '更新时间',
     UNIQUE KEY uk_short_code (short_code),
-    KEY idx_original_url (original_url(50))
+    -- 前缀唯一索引: 防并发创建同一长链产生多个短码
+    -- 注意: MySQL 5.5 utf8mb4 单索引限 767 字节, 191*4=764 < 767, 500*4=2000 超限
+    -- MySQL 8+ 可改用全列唯一索引, 生产环境建议升级后改
+    UNIQUE KEY uk_original_url (original_url(191))
 ) ENGINE=InnoDB AUTO_INCREMENT=1000000 DEFAULT CHARSET=utf8mb4 COMMENT='短链表';
 
 -- 说明: AUTO_INCREMENT 从 1000000 开始

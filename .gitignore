@@ -16,3 +16,12 @@ short-url-server/target/
 # 日志与临时文件
 *.log
 .DS_Store
+
+# Redis dump 文件
+dump.rdb
+
+# AI 工具工作目录
+.workbuddy/
+
+# 环境安装包（Erlang / RabbitMQ 安装程序，装完即弃，勿入库）
+tools/installers/
