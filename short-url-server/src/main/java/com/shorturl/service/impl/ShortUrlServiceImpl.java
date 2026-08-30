@@ -21,6 +21,7 @@ import org.springframework.util.StringUtils;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -191,14 +192,58 @@ public class ShortUrlServiceImpl implements IShortUrlService {
     }
 
     /**
-     * 异步累加点击次数 (阶段3: 由 MQ 消费者调用)
+     * 单条累加点击次数 (同步模式 / MQ 逐条消费模式)
      * 执行 click_count = click_count + 1 的原子更新, 与跳转请求路径解耦
      */
     @Override
     public void recordClick(String shortCode) {
-        // 压测专用: 模拟下游 DB 写入/网络耗时, 用于演示 MQ 把"慢下游"从请求关键路径解耦。
-        // 同步模式: 该耗时阻塞在请求线程内 -> 请求 p99 飙升;
-        // MQ 模式:   该耗时只阻塞消费者线程 -> 请求线程早已返回, 跳转不受影响。
+        simulateDbLatencyOnce();
+        shortUrlMapper.update(null,
+                new LambdaUpdateWrapper<ShortUrl>()
+                        .eq(ShortUrl::getShortCode, shortCode)
+                        .setSql("click_count = click_count + 1")
+        );
+    }
+
+    /**
+     * 批量聚合累加点击次数 (MQ 批量消费模式)
+     *
+     * 典型场景: 一批 100 条 ClickMessage 经 HashMap 合并后只剩 15 个唯一短码
+     *          → DB 写次数从 100 降为 15, 典型压缩比 5~20 倍
+     *          → 热门短码越多, 批内重复度越高, 压缩比越好 (80/20 定律天然利好)
+     *
+     * 语义保持: 加法可合并且顺序无关, 合并前后最终 click_count 数学上完全等价,
+     *          不存在"攒批导致统计错误"的风险。
+     */
+    @Override
+    public void recordClickBatch(Map<String, Long> shortCodeCounts) {
+        if (shortCodeCounts == null || shortCodeCounts.isEmpty()) {
+            return;
+        }
+        // 按短码逐条执行 UPDATE (click_count = click_count + N)
+        // 注: 极端场景下可用 CASE WHEN 合成 1 条 SQL, 但分开写简单直观, MP 拼接安全,
+        //     且批内唯一短码数通常不大, 多条 UPDATE 的总开销仍然远低于逐条消息 UPDATE
+        for (Map.Entry<String, Long> entry : shortCodeCounts.entrySet()) {
+            String shortCode = entry.getKey();
+            Long step = entry.getValue();
+            if (!StringUtils.hasText(shortCode) || step == null || step <= 0) {
+                continue;
+            }
+            simulateDbLatencyOnce();
+            shortUrlMapper.update(null,
+                    new LambdaUpdateWrapper<ShortUrl>()
+                            .eq(ShortUrl::getShortCode, shortCode)
+                            .setSql("click_count = click_count + " + step)
+            );
+        }
+    }
+
+    /**
+     * 压测专用: 模拟下游 DB 写入/网络耗时。
+     * 每次 UPDATE 算 1 次慢下游 (按调用次数模拟, 不是按消息条数)
+     * 批量场景下每批调用次数 = 批内唯一短码数, 正好模拟"少调 DB, 总延迟下降"的效果。
+     */
+    private void simulateDbLatencyOnce() {
         if (simulateDbLatencyMs > 0) {
             try {
                 Thread.sleep(simulateDbLatencyMs);
@@ -206,11 +251,6 @@ public class ShortUrlServiceImpl implements IShortUrlService {
                 Thread.currentThread().interrupt();
             }
         }
-        shortUrlMapper.update(null,
-                new LambdaUpdateWrapper<ShortUrl>()
-                        .eq(ShortUrl::getShortCode, shortCode)
-                        .setSql("click_count = click_count + 1")
-        );
     }
 
     /**

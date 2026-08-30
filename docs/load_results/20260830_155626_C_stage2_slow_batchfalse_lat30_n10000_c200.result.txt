@@ -1,0 +1,37 @@
+========================================================
+URL            : http://127.0.0.1:8082/4c92
+并发连接       : 200
+总请求数       : 10000
+耗时           : 4.01s
+吞吐(QPS)      : 2494.3
+状态码         : {302: 10000}
+延迟(ms) avg  : 74.28
+延迟(ms) min  : 0.34
+延迟(ms) max  : 381.35
+p50/p95/p99   : 55.42 / 172.82 / 259.32
+========================================================
+
+---- extra ----
+LoadTestWallTime_s: 4.73
+QueueDrain_s:      21.2
+QueueDrained:      True
+PreClickDepth:     -1
+PostClickDepth:    -1
+DlxDepth:          -1
+PreClickCount:     1489036
+PostClickCount:    1499036
+ClickDelta:        10000
+SuccessRequests:   10000
+DeltaRatio:        1.0000
+DbUpdateCount:     10000
+UpdatesPerSuccess: 1.0000
+LogSqlLines:       0
+BackendLogMB:      0.0
+VERDICT:           PASS
+SimulateLatency_ms:30
+BatchEnabled:      false
+ShortCode:         4c92
+RunId:             20260830_155626
+Tag:               C_stage2_slow_batchfalse_lat30_n10000_c200
+---- notes ----
+  [NOTE] 死信队列深度不可采集(管理台插件未启用), 改由 click_count 增量兜底判定

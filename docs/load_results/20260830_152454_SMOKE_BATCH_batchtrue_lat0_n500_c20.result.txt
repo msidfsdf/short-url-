@@ -1,0 +1,36 @@
+========================================================
+URL            : http://127.0.0.1:8082/4c92
+并发连接       : 20
+总请求数       : 500
+耗时           : 0.23s
+吞吐(QPS)      : 2197.5
+状态码         : {302: 500}
+延迟(ms) avg  : 8.17
+延迟(ms) min  : 1.12
+延迟(ms) max  : 37.62
+p50/p95/p99   : 4.28 / 24.29 / 32.89
+========================================================
+
+---- extra ----
+LoadTestWallTime_s: 1.50
+QueueDrain_s:      7.6
+QueueDrained:      True
+PreClickDepth:     -1
+PostClickDepth:    -1
+DlxDepth:          -1
+PreClickCount:     1190032
+PostClickCount:    1190532
+ClickDelta:        500
+SuccessRequests:   500
+DeltaRatio:        1.0000
+SqlUpdateCount:    3
+UpdatesPerSuccess: 0.0060
+BackendLogMB:      0.0
+VERDICT:           PASS
+SimulateLatency_ms:0
+BatchEnabled:      true
+ShortCode:         4c92
+RunId:             20260830_152454
+Tag:               SMOKE_BATCH_batchtrue_lat0_n500_c20
+---- notes ----
+  [NOTE] 死信队列深度不可采集(管理台插件未启用), 改由 click_count 增量兜底判定

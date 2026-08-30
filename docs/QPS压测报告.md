@@ -80,10 +80,19 @@
 
 ---
 
-## 四、让 MQ 真正兑现"吞吐收益"的演进方向（已在规划中）
-1. **消费者批量聚合 +1**：把 N 条消息聚成一条 `UPDATE ... SET click_count = click_count + ?`，把 DB 写从 O(N) 降到 O(1)，吞吐立刻反超同步。
+## 四、让 MQ 真正兑现"吞吐收益"的演进方向（第 1 项已实现，原预期落空，见第六章）
+
+1. **消费者批量聚合 +1**（**已实现并压测，原预期被证伪**）
+   - **做法**：把 N 条消息在消费端用 HashMap 按短码合并，聚成一条 `UPDATE ... SET click_count = click_count + N`，DB 写从 O(N) 降到 O(N/100)。
+   - **实测收益**：DB 写次数 **-99%**（99,500 → 995）；慢下游场景全量落库耗时 **376.8s → 8.9s（快 42 倍）**。
+   - **原预期落空**：当初判断"消费提速 → 消除队列堆积 → 解除 broker 流控 → QPS 反超同步"。实测 **QPS 未提升**：批量 4224.6 < 逐条 4672.8 < 同步 9227.9（同一场三方对照，详见 6.3 与 6.7）。
+   - **根因**：本场景单条 ClickMessage 约 60 字节，10 万条合计约 6MB，远未触及 RabbitMQ 默认内存高水位（物理内存 40%，本机数 GB）→ **broker 流控从未触发**，队列堆积也就从未拖累 QPS。真正的 QPS 天花板在**发布侧**（JSON 序列化 + 发往 broker 的一跳往返 + publisher-confirm 回执），批量聚合不解决它。
+   - **修正后的定位**：批量聚合解决的是**数据库写压力**与**最终一致性收敛速度**，不是接口吞吐。只有在"消息体较大 / 持续堆积足以触发 broker 流控"的场景下它才可能带动 QPS——本次 30ms 慢下游组观测到 +6.8%，是唯一的正向信号，但幅度有限。
+
 2. **消费者并发**：`@RabbitListener(concurrency="N")`，但受 Hikari 连接池（默认 10）约束，需同步调大池或配合批量。
-3. **关闭非必要发布确认**：若允许极小概率丢失，可去掉 `publisher-confirm-type`/`publisher-returns` 进一步降低发布延迟（权衡可靠性）。
+3. **关闭非必要发布确认**：若允许极小概率丢失，可去掉 `publisher-confirm-type`/`publisher-returns` 进一步降低发布延迟（权衡可靠性）。——**这条才是真正能提升 QPS 的方向**：第 1 项的实测已表明 QPS 瓶颈在发布侧而非消费侧。
+
+> **教训**：性能预测必须标注为"待验证假设"，实现后要用**同一场**的对照实验去证伪或确认，不能把预期当成既成事实写进结论。本章第 1 项当初就是当成既成事实写的，导致留下错误断言。
 
 ---
 
@@ -111,7 +120,187 @@ python tools/load_test_async.py -u http://localhost:8082/<你的短码> -n 10000
 
 ---
 
-## 六、备注
-- 压测期间 Redis 由本次手动拉起（原手动实例当时未运行）；8081 上原有后端未被触碰。
-- 部分运行出现个位数 ~0.5% 连接重置（`ERR`），为压测客户端瞬时建连突发所致，成功响应均为 302，不影响结论。
+## 六、批量聚合 vs 逐条消费 对照测试（阶段2 原代码 vs 批量聚合）
+
+> 生成时间：2026-08-30
+> 目的：验证"MQ 消费端 HashMap 合并 + UPDATE +N"相比"每条消息 1 次 UPDATE"的真实收益。
+>
+> ⚠️ **本章为重写版本**。此前一版基于"同一份 jar + `batch-enabled` 开关"的 A/B 数据已全部作废，原因见 6.5。
+
+### 6.1 测试方法：两个独立 jar，而不是一个开关
+
+对照组与实验组是**两份不同的代码、打出的两个不同 jar**：
+
+| | 对照组 | 实验组 |
+|---|---|---|
+| 代码 | 阶段2 原样（commit `2037ac0`） | 阶段2 + 批量聚合改动 |
+| 消费者签名 | `ClickMessage` 单条 | `List<Message>` 批量 |
+| 落库方式 | 每消息 1 次 `UPDATE +1` | 批内 HashMap 合并后 `UPDATE +N` |
+| jar | `.workbuddy/jar-stage2.jar` | `.workbuddy/jar-batch.jar` |
+
+代码版本切换用 `git diff` 导出的补丁正反向应用完成，**不使用 `git stash`**（原因见 6.5）。
+
+### 6.2 正确性闸门
+
+每组压测结束后必须全部满足，否则该组判废、脚本以退出码 2 结束：
+
+| 闸门 | 判定标准 |
+|---|---|
+| 落库完整性 | `click_count` 增量 ÷ 成功请求数 ≥ 99% |
+| 死信队列 | 深度 == 0（不可采集时降级，由落库增量兜底判定） |
+| 后端日志 | < 20MB（膨胀说明在刷异常堆栈，I/O 会污染被测系统） |
+
+**四组结果均为落库率 100.00%、VERDICT: PASS。**
+
+### 6.3 数据结果
+
+#### 6.3.1 平凡本地写（simulate-db-latency-ms=0），100k 请求 / 500 并发
+
+| 指标 | 对照组：阶段2 逐条 | 实验组：批量聚合 | 变化 |
+|---|---|---|---|
+| 吞吐 (QPS) | 4672.8 | 4224.6 | -9.6% |
+| 延迟 avg (ms) | 104.58 | 115.88 | +10.8% |
+| 延迟 p50 (ms) | 100.51 | 119.34 | +18.7% |
+| 延迟 p95 (ms) | 199.74 | 196.60 | -1.6% |
+| 延迟 p99 (ms) | 252.38 | 249.93 | -1.0% |
+| 延迟 max (ms) | 345.77 | 328.12 | -5.1% |
+| **全部点击落库耗时** | **52.2s** | **7.7s** | **-85.2%** ⭐ |
+| **DB UPDATE 次数** | **99500** | **995** | **-99.0%** ⭐ |
+| 每请求平均写次数 | 1.0000 | 0.0100 | -99.0% |
+| 成功请求 | 99500（ERR 500） | 99500（ERR 500） | 一致 |
+
+#### 6.3.2 慢下游（simulate-db-latency-ms=30），10k 请求 / 200 并发
+
+| 指标 | 对照组：阶段2 逐条 | 实验组：批量聚合 | 变化 |
+|---|---|---|---|
+| 吞吐 (QPS) | 3098.0 | 3309.5 | +6.8% |
+| 延迟 avg (ms) | 59.36 | 53.12 | -10.5% |
+| 延迟 p50 (ms) | 55.76 | 9.24 | -83.4% ⭐ |
+| 延迟 p95 (ms) | 133.12 | 140.91 | +5.8% |
+| 延迟 p99 (ms) | 154.10 | 211.42 | +37.2% |
+| **全部点击落库耗时** | **376.8s** | **8.9s** | **-97.6%（快 42 倍）** ⭐ |
+| **DB UPDATE 次数** | **10000** | **100** | **-99.0%** ⭐ |
+| 每请求平均写次数 | 1.0000 | 0.0100 | -99.0% |
+| 成功请求 | 10000 | 10000 | 一致 |
+
+### 6.4 结论
+
+**收益稳定且量级显著（两组场景一致）：**
+
+1. **DB 写次数降 99%**——10 万次点击从 99500 次 UPDATE 降到 995 次；慢下游场景从 10000 降到 100。压缩比稳定在 100:1，与 `batch-size=100` 的理论值完全吻合（99500 ÷ 100 ≈ 995）。
+
+2. **最终一致性收敛时间大幅缩短**——0ms 场景 52.2s → 7.7s（-85%）；30ms 慢下游场景 **376.8s → 8.9s（-97.6%，快 42 倍）**。这是慢下游场景下最关键的收益：逐条消费时单消费者串行处理，1 万条 × 30ms 需要 6 分多钟才能追平，批量聚合只需 9 秒。
+
+**HTTP 层指标基本持平，方向不一致，不做因果解读：**
+
+- 0ms 场景批量版 QPS 低 9.6%、p50 高 18.7%；30ms 场景批量版 QPS 高 6.8%、p50 低 83.4%。
+- p95/p99 两组互有胜负，差异方向不一致。
+- **批量聚合本来就不是用来提升跳转接口 QPS 的**。跳转请求命中 Redis 后直接 302，写库早已异步解耦，消费端怎么优化都不该显著影响它。观测到的差异更接近单次运行噪声。
+
+**一句话总结**：批量聚合把"消费端写库次数"和"最终一致性收敛时间"各压掉一到两个数量级，HTTP 层指标基本不变。这是**用极小的接口侧代价，换下游数据库压力的陡降**，且在慢下游场景下价值最大。
+
+### 6.5 前序数据作废说明（重要）
+
+此前一版第六章的数据（QPS 3329.8 → 3523.8、p99 -25.8% 等）**已全部作废**。事后核查发现五处缺陷，任何一条都足以让结论不成立：
+
+1. **对照组污染（死代码）**：对照组并非阶段2 原代码，而是"改过的代码 + `batch-enabled=false` 开关"。`consumerBatchEnabled=false` 时容器走单条适配器，会把单个 JSON Object 喂给 `List<ClickMessage>` 参数，Jackson 反序列化在进入方法体之前就失败——那个"逐条分支"是**永远执行不到的死代码**。实测对照组 **56374 次反序列化失败、0 次落库**，QPS 数字测的是"消费者全死"的系统。
+
+2. **实验组同样全挂**：spring-amqp 3.1.7 在批量模式下拿不到 `amqp_deliveryTag` header（该版本 `SimpleRabbitListenerContainerFactory` 没有 `setBatchAckMode` 方法），每批抛 `Missing header`，**四组 SQL 执行次数均为 0**。
+
+3. **判定逻辑失效**：压测脚本把"队列深度读取失败(-1)"当成"队列已空(0)"处理，四组都呈现 `QueueDrained=True` 的假象，导致问题当时未被发现。
+
+4. **竞争消费者**：测试期间 IntelliJ 中运行着另一个 short-url 实例，与压测后端抢同一个队列（约占 19% 消息）。它使批量组的 UPDATE 计数从理论值 995 虚高到 19559。
+
+5. **日志 I/O 不公平**：MyBatis 逐条 SQL 日志使对照组日志量远大于实验组（825MB vs 17KB），同步 stdout I/O 不公平地拖慢对照组。
+
+**本章针对上述问题的修复**：
+
+| 缺陷 | 修复 |
+|---|---|
+| 对照组污染 | 两个独立 jar，对照组用阶段2 原代码，不再有开关分支 |
+| deliveryTag 取不到 | 改用 `List<Message>` 参数 + `getMessageProperties().getDeliveryTag()` 手动取 |
+| 判定逻辑失效 | 以 MySQL `click_count` 稳态替代队列深度判定 |
+| 竞争消费者 | 压测前确认 8082 与队列无其他消费者 |
+| 日志 I/O 不公平 | 关闭 MyBatis SQL 日志，改用 MySQL `Com_update` 计数器统计写次数 |
+
+### 6.6 复现命令
+
+```bash
+# 0) 前置：确认无竞争消费者（8082 无监听、无其他 short-url 的 java 进程），
+#    并让 Redis 可写：
+#    redis-cli CONFIG SET stop-writes-on-bgsave-error no
+#    redis-cli CONFIG SET dir <可写目录>
+
+# 1) 导出当前改动为补丁（用于来回切换代码版本，比 git stash 安全）
+git diff HEAD -- \
+  short-url-server/src/main/java/com/shorturl/config/RabbitMQConfig.java \
+  short-url-server/src/main/java/com/shorturl/mq/ClickCountConsumer.java \
+  short-url-server/src/main/java/com/shorturl/service/IShortUrlService.java \
+  short-url-server/src/main/java/com/shorturl/service/impl/ShortUrlServiceImpl.java \
+  short-url-server/src/main/resources/application.yml \
+  > .workbuddy/stage3-batch-backup.patch
+
+# 2) 切回阶段2，打对照组 jar
+patch -p1 -R < .workbuddy/stage3-batch-backup.patch
+mvn clean package -DskipTests
+cp target/short-url-server-1.0.0.jar .workbuddy/jar-stage2.jar
+
+# 3) 恢复批量聚合代码，打实验组 jar
+patch -p1 < .workbuddy/stage3-batch-backup.patch
+mvn clean package -DskipTests
+cp target/short-url-server-1.0.0.jar .workbuddy/jar-batch.jar
+
+# 4) 跑压测（每次先切换 target 里的 jar）
+cp .workbuddy/jar-stage2.jar target/short-url-server-1.0.0.jar
+python tools/run_load_test_batch.py --simulate-latency-ms 0 \
+    --label A2_stage2 --total 100000 --concurrency 500 --short-code 4c92
+
+cp .workbuddy/jar-batch.jar target/short-url-server-1.0.0.jar
+python tools/run_load_test_batch.py --simulate-latency-ms 0 \
+    --label B2_batch --total 100000 --concurrency 500 --short-code 4c92
+
+# 慢下游：对照组需放宽等待上限（单消费者串行，1万条 × 30ms ≈ 300s）
+cp .workbuddy/jar-stage2.jar target/short-url-server-1.0.0.jar
+python tools/run_load_test_batch.py --simulate-latency-ms 30 \
+    --label C2_stage2_slow --total 10000 --concurrency 200 --settle-max-wait 600
+
+cp .workbuddy/jar-batch.jar target/short-url-server-1.0.0.jar
+python tools/run_load_test_batch.py --simulate-latency-ms 30 \
+    --label D2_batch_slow --total 10000 --concurrency 200 --settle-max-wait 600
+```
+
+结果写入 `docs/load_results/*.result.txt`，含 QPS、延迟分位数、落库耗时、`DbUpdateCount`、`DeltaRatio`、`VERDICT` 等字段。闸门不通过时脚本退出码为 2，并在结果文件 `problems` 段落写明原因。
+
+### 6.7 补测：加入同步模式基线后的三方对照（证伪第四章预期）
+
+第四章曾预期"批量聚合后吞吐立刻反超同步"。为验证这句话，补测同步模式基线 E2（阶段2 jar + `-Dshort-url.click.async-enabled=false`，0ms，10万/500并发，PASS，落库率 100.00%），与 A2/B2 构成**同一场**三方对照：
+
+| 模式 | QPS | p50 | p95 | p99 | 落库耗时 | DB UPDATE |
+|---|---|---|---|---|---|---|
+| **E2 同步写库（阶段1 路径）** | **9227.9** | **45.64** | **89.37** | **104.15** | 6.4s | 99500 |
+| A2 MQ 逐条消费（阶段2） | 4672.8 | 100.51 | 199.74 | 252.38 | 52.2s | 99500 |
+| B2 MQ 批量聚合 | 4224.6 | 119.34 | 196.60 | 249.93 | 7.7s | **995** |
+
+**结论：原预期被证伪。** 批量聚合的 QPS 只有同步模式的 **45.8%**，且比 MQ 逐条还低 9.6%；p50/p95/p99 三项均由同步模式大幅领先。
+
+**为什么"消费提速"没有换来 QPS？**
+- 批量聚合让消费效率提升约 100 倍（落库耗时 52.2s → 7.7s），但 QPS 纹丝不动 → 说明**队列堆积从来没有拖累过 QPS**。
+- 原因：单条 `ClickMessage` 约 60 字节，10 万条合计约 6MB，远未触及 RabbitMQ 默认内存高水位（物理内存 40%，本机数 GB）→ **broker 流控从未触发**，publisher 也就从未被阻塞。
+- 真正的 QPS 天花板在**发布侧**：JSON 序列化 + 发往 broker 的一跳网络往返 + publisher-confirm 回执。这部分是每条请求都逃不掉的固定开销，批量聚合不解决它。
+
+**仍需注意的边界**：30ms 慢下游组（C2 → D2）观测到 QPS +6.8%，是批量聚合在 QPS 上唯一的正向信号——那是真正存在持续堆积的场景。说明该优化在"消息体较大 / 堆积足以触发流控"时可能有效，但幅度远达不到"反超同步"。
+
+> 一句话：**批量聚合是"数据库写压力"与"一致性收敛速度"的优化，不是接口吞吐优化。** 想提升 QPS，方向在发布侧（关闭 publisher-confirm 等），见第四章第 3 项。
+
+---
+
+## 七、备注（原第六节顺延）
+
+- 压测期间 Redis 需确认可写（若出现 `MISCONF Redis is configured to save RDB snapshots...`，可执行 `redis-cli CONFIG SET stop-writes-on-bgsave-error no` 绕过，或把 Redis `CONFIG SET dir` 指向一个可写目录）。
+- 部分运行出现个位数 ~0.5% 连接重置（`ERR`），为压测客户端 asyncio TCP 关闭回调偶发 WinError 10054，成功响应均为 302，不影响结论。
 - 测试后 `click_count` 累计偏大属正常（多次压测叠加 + MQ 最终一致），不影响接口与结论。
+- 压测前务必确认**没有竞争消费者**：任何额外运行的 short-url 实例（如 IDE 里启着的）都会与压测后端抢同一个队列，同时消费消息，导致落库耗时与 UPDATE 计数失真。
+- 本机 RabbitMQ 未启用 management 插件，15672 端口无监听，管理台 HTTP API 不可用；队列深度改用 MySQL `click_count` 稳态判定，死信深度不可观测（由落库增量兜底）。
+- DB 写次数取自 MySQL 全局计数器 `Com_update` 的前后差值（已验证静默期零漂移），压测期间通过 `-Dmybatis-plus.configuration.log-impl=org.apache.ibatis.logging.nologging.NoLoggingImpl` 关闭逐条 SQL 日志，避免日志 I/O 成为不公平干扰项。
+- 第六章四组（A2/B2/C2/D2）原始结果已归档于 `docs/load_results/*.result.txt`；更早的四组（A/B/C/D）已作废，仅作问题留档保留。
+

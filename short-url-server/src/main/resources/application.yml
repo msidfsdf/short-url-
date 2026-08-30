@@ -56,7 +56,7 @@ short-url:
     async-enabled: true
     # 压测专用: 模拟下游 DB 写入耗时(ms), 用于演示 MQ 解耦"慢下游"的收益; 0=不模拟
     simulate-db-latency-ms: 0
-  # ===== MQ 队列/交换机名称 (阶段3) =====
+  # ===== MQ 队列/交换机名称 (阶段2) =====
   mq:
     # 正常链路: 跳转发送点击事件 -> 消费者异步 +1
     click-exchange: "short-url.click.exchange"
@@ -66,6 +66,13 @@ short-url:
     dlx-exchange: "short-url.dlx.exchange"
     dlx-queue: "short-url.click.dlx.queue"
     dlx-routing-key: "short-url.click.dlx.routing"
+    # ===== 批量消费配置 (始终开启, 无关闭开关) =====
+    # 批量与单条的监听器方法签名不兼容, 不做运行时开关;
+    # 需要"逐条"基线做 A/B 对比时, 用阶段2 原始代码打包运行即可。
+    # 每批最大消息数 (攒满/超时二选一触发交付); 越大压缩比越好但延迟略高
+    batch-size: 100
+    # 攒不够 batch-size 时的等待上限 (ms); 越大批越满但单条延迟越高; 建议 100~500ms
+    batch-timeout-ms: 200
 
 logging:
   level:
