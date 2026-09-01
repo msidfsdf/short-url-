@@ -1,6 +1,7 @@
 package com.shorturl.controller;
 
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.shorturl.common.CacheGuardMetrics;
 import com.shorturl.common.R;
 import com.shorturl.entity.dto.ShortUrlCreateDTO;
 import com.shorturl.entity.vo.ShortUrlVO;
@@ -12,6 +13,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
 import java.io.IOException;
+import java.util.Map;
 
 /**
  * 短链 Controller
@@ -27,6 +29,7 @@ import java.io.IOException;
 public class ShortUrlController {
 
     private final IShortUrlService shortUrlService;
+    private final CacheGuardMetrics cacheGuardMetrics;
 
     /**
      * 生成短链
@@ -65,5 +68,21 @@ public class ShortUrlController {
         }
         response.setStatus(302);
         response.setHeader("Location", originalUrl);
+    }
+
+    /**
+     * 缓存防护计数器快照 (阶段4 压测取数用)
+     * 压测脚本在每组开始前 reset、结束后读取, 用于量化三层防护各自挡掉的流量。
+     */
+    @GetMapping("/api/short-url/cache-guard/metrics")
+    public R<Map<String, Long>> cacheGuardMetrics() {
+        return R.ok(cacheGuardMetrics.snapshot());
+    }
+
+    /** 计数器清零 (压测每组开始前调用) */
+    @PostMapping("/api/short-url/cache-guard/metrics/reset")
+    public R<String> resetCacheGuardMetrics() {
+        cacheGuardMetrics.reset();
+        return R.ok("ok");
     }
 }

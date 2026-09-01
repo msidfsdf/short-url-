@@ -56,6 +56,30 @@ short-url:
     async-enabled: true
     # 压测专用: 模拟下游 DB 写入耗时(ms), 用于演示 MQ 解耦"慢下游"的收益; 0=不模拟
     simulate-db-latency-ms: 0
+  # ===== 阶段4 缓存穿透/击穿防护 =====
+  cache-guard:
+    # 防护模式:
+    #   none           = 阶段1~3 原逻辑, 无任何防护 (A/B 压测基线对照组)
+    #   mutex          = 互斥锁重建, 强一致, 未抢到锁的请求会短暂等待
+    #   logical-expiry = 逻辑过期, 请求零等待, 热 key 过期瞬间返回旧值
+    mode: mutex
+    # 空值缓存: 布隆误判漏过来的非法短码, 查完 DB 后也写一份空值标记,
+    #          避免同一个非法短码被反复刷时重复打 DB
+    null-enabled: true
+    null-ttl-seconds: 120
+    # 分布式锁
+    lock-wait-ms: 3000              # 抢锁最长等待时间, 超时后降级直查 DB 保证可用性
+    lock-expire-seconds: 10         # 锁过期时间, 兜底防止持有者崩溃导致死锁
+    lock-retry-interval-ms: 20      # 未抢到锁时, 双重检查前的等待间隔
+    # 逻辑过期模式专用: value 内的逻辑过期时长; Redis 物理 TTL 仍按 cache-ttl-days 兜底
+    logical-expire-seconds: 300
+    # 布隆过滤器
+    bloom:
+      enabled: true
+      warm-up: true                 # 启动时从 DB 全量加载 short_code 预热
+      key: "short:url:bloom"
+      expected-insertions: 1000000  # 预期插入量 n, 决定位数组大小
+      false-probability: 0.01       # 可接受误判率 p; n=100万/p=1% -> 约 1.2MB, k=7
   # ===== MQ 队列/交换机名称 (阶段2) =====
   mq:
     # 正常链路: 跳转发送点击事件 -> 消费者异步 +1
