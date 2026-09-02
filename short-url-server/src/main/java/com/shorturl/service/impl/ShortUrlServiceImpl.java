@@ -12,6 +12,7 @@ import com.shorturl.mapper.ShortUrlMapper;
 import com.shorturl.mq.ClickProducer;
 import com.shorturl.service.IShortUrlService;
 import com.shorturl.utils.Base62Utils;
+import com.shorturl.utils.FeistelUtils;
 import com.shorturl.utils.RedisBloomFilter;
 import com.shorturl.utils.RedisLock;
 import lombok.RequiredArgsConstructor;
@@ -166,8 +167,10 @@ public class ShortUrlServiceImpl implements IShortUrlService {
             throw e;
         }
 
-        // 3. ID 转 62 进制得到 shortCode,更新回 DB
-        String shortCode = Base62Utils.encode(shortUrl.getId());
+        // 3. ID 经 Feistel 双射置换打乱后再转 62 进制得到 shortCode,更新回 DB
+        //    Feistel 保证: ① 不碰撞(双射,一一对应) ② 连号 id → 混淆值完全不可预测
+        //    从而防止攻击者用 4c92/4c93/4c94 这种连号短码遍历爬光全部短链。
+        String shortCode = Base62Utils.encode(FeistelUtils.encrypt(shortUrl.getId()));
         shortUrl.setShortCode(shortCode);
         shortUrlMapper.updateById(shortUrl);
 
