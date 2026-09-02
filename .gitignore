@@ -17,6 +17,9 @@ short-url-server/target/
 *.log
 .DS_Store
 
+# Office lock 临时文件（如 ~$README.docx 等，绝不能进 git）
+~$*
+
 # Redis dump 文件
 dump.rdb
 
